@@ -21,6 +21,11 @@ internal static class Program
             return RunSelfTestAsync().GetAwaiter().GetResult();
         }
 
+        if (args.Contains("--test-warp", StringComparer.OrdinalIgnoreCase))
+        {
+            return RunWarpTestAsync().GetAwaiter().GetResult();
+        }
+
         using var mutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out var isFirstInstance);
         using var activateEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ActivateEventName);
 
@@ -252,6 +257,162 @@ internal static class Program
             Console.WriteLine($"End-to-end VLESS HTTPS test: {(int)resp.StatusCode} {resp.StatusCode}");
             if ((int)resp.StatusCode is not (204 or 200))
                 throw new InvalidOperationException($"Unexpected HTTP status via VLESS: {resp.StatusCode}");
+        }
+        finally
+        {
+            try
+            {
+                if (!clientProc.HasExited)
+                {
+                    clientProc.Kill(entireProcessTree: true);
+                    clientProc.WaitForExit(1500);
+                }
+            }
+            catch { }
+            try
+            {
+                if (File.Exists(clientConfigPath))
+                    File.Delete(clientConfigPath);
+            }
+            catch { }
+        }
+    }
+
+    private static async Task<int> RunWarpTestAsync()
+    {
+        try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+        try
+        {
+            var settings = AppSettings.Load();
+            var progress = new Progress<string>(msg => Console.WriteLine($"[WARP] {msg}"));
+            await XrayDownloader.EnsureXrayAsync(progress, CancellationToken.None);
+
+            var account = await WarpAccountService.EnsureAccountAsync(settings, progress, CancellationToken.None);
+            var (endpoint, exitIp) = await WarpAccountService.FindWorkingEndpointAsync(account, progress, CancellationToken.None);
+            account.Endpoint = endpoint;
+            settings.Save();
+            Console.WriteLine($"WARP account OK: v4={account.AddressV4}, endpoint={endpoint}, exitIp={exitIp}");
+
+            var testSettings = new AppSettings
+            {
+                Uuid = settings.Uuid,
+                Port = GetFreeTcpPort(),
+                PreferredIp = settings.PreferredIp,
+                BlockQuic = settings.BlockQuic,
+                EnableTgBridge = false,
+                TgBridgePort = GetFreeTcpPort(),
+                VerboseLogging = settings.VerboseLogging,
+                WarpMode = WarpRoutingMode.AllExceptRu,
+                WarpAccount = account
+            };
+
+            var adapters = NetworkDetector.GetLanAdapters();
+            var best = NetworkDetector.SelectBestAdapter(adapters, settings.PreferredIp);
+
+            using var manager = new XrayProcessManager();
+            try
+            {
+                await manager.StartAsync(testSettings, best?.IpAddress, tgStatus: null);
+                await VerifyVlessWarpTikTokAsync(testSettings.Uuid, testSettings.Port);
+            }
+            finally
+            {
+                manager.Stop();
+            }
+
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"WARP TEST FAILED: {ex}");
+            return 1;
+        }
+    }
+
+    private static async Task VerifyVlessWarpTikTokAsync(string uuid, int serverPort)
+    {
+        var socksPort = GetFreeTcpPort();
+        var clientConfigPath = Path.Combine(AppSettings.BinDirectory, "xray.warptest-client.json");
+
+        var clientConfig = new
+        {
+            log = new { loglevel = "warning" },
+            inbounds = new object[]
+            {
+                new
+                {
+                    tag = "socks-in",
+                    listen = "127.0.0.1",
+                    port = socksPort,
+                    protocol = "socks",
+                    settings = new { udp = true }
+                }
+            },
+            outbounds = new object[]
+            {
+                new
+                {
+                    tag = "proxy",
+                    protocol = "vless",
+                    settings = new
+                    {
+                        vnext = new[]
+                        {
+                            new
+                            {
+                                address = "127.0.0.1",
+                                port = serverPort,
+                                users = new[]
+                                {
+                                    new { id = uuid, encryption = "none" }
+                                }
+                            }
+                        }
+                    },
+                    streamSettings = new
+                    {
+                        network = "tcp",
+                        security = "none"
+                    }
+                }
+            }
+        };
+
+        await File.WriteAllTextAsync(clientConfigPath, JsonSerializer.Serialize(clientConfig));
+
+        using var clientProc = new System.Diagnostics.Process
+        {
+            StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = AppSettings.XrayExePath,
+                Arguments = $"run -c \"{clientConfigPath}\"",
+                WorkingDirectory = AppSettings.BinDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+            }
+        };
+
+        try
+        {
+            clientProc.Start();
+            await Task.Delay(500);
+
+            var handler = new HttpClientHandler
+            {
+                Proxy = new WebProxy($"socks5://127.0.0.1:{socksPort}"),
+                UseProxy = true
+            };
+            using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(12) };
+            using var probeResp = await http.GetAsync("https://cp.cloudflare.com/generate_204");
+            Console.WriteLine($"End-to-end VLESS -> WARP generate_204 test: {(int)probeResp.StatusCode} {probeResp.StatusCode}");
+            if ((int)probeResp.StatusCode is not (204 or 200))
+                throw new InvalidOperationException($"Unexpected HTTP status for generate_204 via WARP: {probeResp.StatusCode}");
+
+            using var resp = await http.GetAsync("https://www.tiktok.com/");
+            Console.WriteLine($"End-to-end VLESS -> WARP TikTok test: {(int)resp.StatusCode} {resp.StatusCode}");
+            if ((int)resp.StatusCode >= 400)
+                throw new InvalidOperationException($"Unexpected HTTP status for TikTok via WARP: {resp.StatusCode}");
         }
         finally
         {

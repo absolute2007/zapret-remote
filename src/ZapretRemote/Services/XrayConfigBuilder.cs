@@ -32,6 +32,67 @@ public static class XrayConfigBuilder
         "domain:youtu.be"
     ];
 
+    private static readonly string[] WarpSelectiveDomains =
+    [
+        // TikTok
+        "domain:tiktok.com",
+        "domain:tiktokv.com",
+        "domain:tiktokcdn.com",
+        "domain:tiktokcdn-eu.com",
+        "domain:tiktokcdn-us.com",
+        "domain:tiktokw.us",
+        "domain:ttwstatic.com",
+        "domain:byteoversea.com",
+        "domain:ibytedtos.com",
+        "domain:ibyteimg.com",
+        "domain:musical.ly",
+        // AI & blocked services
+        "domain:openai.com",
+        "domain:chatgpt.com",
+        "domain:oaistatic.com",
+        "domain:oaiusercontent.com",
+        "domain:claude.ai",
+        "domain:anthropic.com",
+        "domain:gemini.google.com",
+        "domain:copilot.microsoft.com",
+        "domain:perplexity.ai",
+        // Social / media / Cloudflare-heavy
+        "domain:instagram.com",
+        "domain:cdninstagram.com",
+        "domain:fbcdn.net",
+        "domain:facebook.com",
+        "domain:x.com",
+        "domain:twitter.com",
+        "domain:twimg.com",
+        "domain:spotify.com",
+        "domain:scdn.co",
+        "domain:notion.so",
+        "domain:dash.cloudflare.com",
+        "domain:canva.com",
+        "domain:figma.com",
+        "domain:rutracker.org",
+        "domain:ntc.party"
+    ];
+
+    private static readonly string[] RussianDirectDomains =
+    [
+        "domain:ru",
+        "domain:su",
+        "domain:xn--p1ai",
+        "domain:vk.com",
+        "domain:vk.me",
+        "domain:userapi.com",
+        "domain:yandex.net",
+        "domain:yastatic.net",
+        "domain:ozon.com",
+        "domain:wildberries.org",
+        "domain:avito.st",
+        "domain:gosuslugi.ru",
+        "domain:sberbank.com",
+        "domain:tinkoff.com",
+        "domain:tbank.com"
+    ];
+
     public static string BuildVlessUri(string uuid, string lanIp, int port, string remark = "PC-Zapret")
     {
         var safeHost = string.IsNullOrWhiteSpace(lanIp) ? "127.0.0.1" : lanIp.Trim();
@@ -82,7 +143,11 @@ public static class XrayConfigBuilder
         return $"happ://routing/onadd/{b64}";
     }
 
-    public static string BuildRuntimeConfigJson(AppSettings settings, string? currentLanIp, TgWsProxyStatus? tgStatus)
+    public static string BuildRuntimeConfigJson(
+        AppSettings settings,
+        string? currentLanIp,
+        TgWsProxyStatus? tgStatus,
+        int? warpProbePort = null)
     {
         var loopIps = new List<string> { "127.0.0.0/8" };
         if (!string.IsNullOrWhiteSpace(currentLanIp))
@@ -93,6 +158,9 @@ public static class XrayConfigBuilder
         var bridgeEnabled = settings.EnableTgBridge &&
                             tgStatus is { IsReadyForBridge: true } &&
                             settings.TgBridgePort != settings.Port;
+
+        var warpActive = settings.WarpMode != WarpRoutingMode.Off &&
+                         settings.WarpAccount is { IsValid: true };
 
         var destOverride = settings.BlockQuic
             ? new[] { "http", "tls" }
@@ -146,6 +214,18 @@ public static class XrayConfigBuilder
                     port = tgStatus.LocalPort,
                     network = "tcp"
                 }
+            });
+        }
+
+        if (warpActive && warpProbePort is > 0)
+        {
+            inbounds.Add(new
+            {
+                tag = "warp-probe-in",
+                listen = "127.0.0.1",
+                port = warpProbePort.Value,
+                protocol = "socks",
+                settings = new { udp = false }
             });
         }
 
@@ -219,6 +299,61 @@ public static class XrayConfigBuilder
             });
         }
 
+        if (warpActive && settings.WarpAccount is { } warp)
+        {
+            outbounds.Add(new
+            {
+                tag = "warp",
+                protocol = "wireguard",
+                settings = new
+                {
+                    secretKey = warp.PrivateKey,
+                    address = new[]
+                    {
+                        $"{warp.AddressV4}/32",
+                        $"{warp.AddressV6}/128"
+                    },
+                    peers = new[]
+                    {
+                        new
+                        {
+                            publicKey = warp.PeerPublicKey,
+                            allowedIPs = new[] { "0.0.0.0/0", "::/0" },
+                            endpoint = warp.Endpoint,
+                            keepAlive = 20
+                        }
+                    },
+                    reserved = warp.Reserved,
+                    mtu = 1280,
+                    domainStrategy = "ForceIPv4"
+                },
+                streamSettings = new
+                {
+                    sockopt = new
+                    {
+                        dialerProxy = "warp-noise"
+                    }
+                }
+            });
+
+            outbounds.Add(new
+            {
+                tag = "warp-noise",
+                protocol = "freedom",
+                settings = new
+                {
+                    noises = new object[]
+                    {
+                        new { type = "rand", packet = "10-30", delay = "10-20" },
+                        new { type = "rand", packet = "30-60", delay = "10-20" },
+                        new { type = "rand", packet = "60-120", delay = "10-20" },
+                        new { type = "rand", packet = "120-200", delay = "10-20" },
+                        new { type = "rand", packet = "40-90", delay = "10-20" }
+                    }
+                }
+            });
+        }
+
         var rules = new List<object>
         {
             new
@@ -230,6 +365,16 @@ public static class XrayConfigBuilder
                 outboundTag = "block"
             }
         };
+
+        if (warpActive && warpProbePort is > 0)
+        {
+            rules.Add(new
+            {
+                type = "field",
+                inboundTag = new[] { "warp-probe-in" },
+                outboundTag = "warp"
+            });
+        }
 
         if (bridgeEnabled)
         {
@@ -278,12 +423,66 @@ public static class XrayConfigBuilder
             outboundTag = "block"
         });
 
-        rules.Add(new
+        if (warpActive)
         {
-            type = "field",
-            inboundTag = new[] { "lan-in" },
-            outboundTag = "direct"
-        });
+            if (settings.WarpMode == WarpRoutingMode.Selective)
+            {
+                rules.Add(new
+                {
+                    type = "field",
+                    inboundTag = new[] { "lan-in" },
+                    domain = WarpSelectiveDomains,
+                    outboundTag = "warp"
+                });
+
+                rules.Add(new
+                {
+                    type = "field",
+                    inboundTag = new[] { "lan-in" },
+                    outboundTag = "direct"
+                });
+            }
+            else if (settings.WarpMode == WarpRoutingMode.AllExceptRu)
+            {
+                rules.Add(new
+                {
+                    type = "field",
+                    inboundTag = new[] { "lan-in" },
+                    ip = new[]
+                    {
+                        "10.0.0.0/8",
+                        "172.16.0.0/12",
+                        "192.168.0.0/16",
+                        "127.0.0.0/8"
+                    },
+                    outboundTag = "direct"
+                });
+
+                rules.Add(new
+                {
+                    type = "field",
+                    inboundTag = new[] { "lan-in" },
+                    domain = RussianDirectDomains,
+                    outboundTag = "direct"
+                });
+
+                rules.Add(new
+                {
+                    type = "field",
+                    inboundTag = new[] { "lan-in" },
+                    outboundTag = "warp"
+                });
+            }
+        }
+        else
+        {
+            rules.Add(new
+            {
+                type = "field",
+                inboundTag = new[] { "lan-in" },
+                outboundTag = "direct"
+            });
+        }
 
         var dnsServers = new List<object>();
         var gatewayIp = NetworkDetector.GetGatewayIpv4(currentLanIp);
@@ -316,8 +515,8 @@ public static class XrayConfigBuilder
                 {
                     ["0"] = new
                     {
-                        handshake = 4,
-                        connIdle = 20,
+                        handshake = 8,
+                        connIdle = 60,
                         uplinkOnly = 1,
                         downlinkOnly = 1
                     }
@@ -335,10 +534,14 @@ public static class XrayConfigBuilder
         return JsonSerializer.Serialize(config, PrettyJsonOptions);
     }
 
-    public static string WriteRuntimeConfig(AppSettings settings, string? currentLanIp, TgWsProxyStatus? tgStatus)
+    public static string WriteRuntimeConfig(
+        AppSettings settings,
+        string? currentLanIp,
+        TgWsProxyStatus? tgStatus,
+        int? warpProbePort = null)
     {
         Directory.CreateDirectory(AppSettings.BinDirectory);
-        var json = BuildRuntimeConfigJson(settings, currentLanIp, tgStatus);
+        var json = BuildRuntimeConfigJson(settings, currentLanIp, tgStatus, warpProbePort);
         var tmpPath = AppSettings.RuntimeConfigPath + ".tmp";
         File.WriteAllText(tmpPath, json);
         File.Move(tmpPath, AppSettings.RuntimeConfigPath, overwrite: true);

@@ -4,6 +4,47 @@ using System.Text.Json.Serialization;
 namespace ZapretRemote.Models;
 
 /// <summary>
+/// Routing mode for built-in Cloudflare WARP outbound.
+/// </summary>
+public enum WarpRoutingMode
+{
+    Off = 0,
+    Selective = 1,
+    AllExceptRu = 2
+}
+
+/// <summary>
+/// Stored Cloudflare WARP WireGuard credentials and verified endpoint.
+/// </summary>
+public sealed class WarpAccountData
+{
+    public const string DefaultEndpoint = "162.159.192.1:2408";
+
+    public string PrivateKey { get; set; } = string.Empty;
+
+    public string PublicKey { get; set; } = string.Empty;
+
+    public string PeerPublicKey { get; set; } = string.Empty;
+
+    public string AddressV4 { get; set; } = string.Empty;
+
+    public string AddressV6 { get; set; } = string.Empty;
+
+    public int[] Reserved { get; set; } = [];
+
+    public string Endpoint { get; set; } = DefaultEndpoint;
+
+    [JsonIgnore]
+    public bool IsValid =>
+        !string.IsNullOrWhiteSpace(PrivateKey) &&
+        !string.IsNullOrWhiteSpace(PeerPublicKey) &&
+        !string.IsNullOrWhiteSpace(AddressV4) &&
+        !string.IsNullOrWhiteSpace(AddressV6) &&
+        Reserved is { Length: 3 } &&
+        !string.IsNullOrWhiteSpace(Endpoint);
+}
+
+/// <summary>
 /// Persistent application settings stored next to the executable.
 /// </summary>
 public sealed class AppSettings
@@ -32,6 +73,10 @@ public sealed class AppSettings
     public int TgBridgePort { get; set; } = DefaultTgBridgePort;
 
     public bool VerboseLogging { get; set; } = false;
+
+    public WarpRoutingMode WarpMode { get; set; } = WarpRoutingMode.Off;
+
+    public WarpAccountData? WarpAccount { get; set; }
 
     public static string SettingsPath => Path.Combine(AppContext.BaseDirectory, "settings.json");
 

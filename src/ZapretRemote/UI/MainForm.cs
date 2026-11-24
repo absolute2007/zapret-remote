@@ -50,6 +50,8 @@ public sealed class MainForm : Form
     private readonly CheckBox _blockQuicCheck;
     private readonly CheckBox _enableTgBridgeCheck;
     private readonly CheckBox _verboseLogCheck;
+    private readonly ComboBox _warpModeCombo;
+    private readonly Button _warpTestButton;
 
     // Right column: Large QR & Share
     private readonly Button _happTabButton;
@@ -105,7 +107,7 @@ public sealed class MainForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(920, 650);
+        ClientSize = new Size(920, 695);
 
         EnableDarkTitleBar(Handle);
 
@@ -299,7 +301,7 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 6
+            RowCount = 7
         };
         netLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
@@ -376,8 +378,49 @@ public sealed class MainForm : Form
         _enableTgBridgeCheck.CheckedChanged += async (_, _) => await OnToggleOptionChangedAsync();
 
         _verboseLogCheck = CreateCheckBox("Подробный лог Xray (info)", _settings.VerboseLogging);
-        _verboseLogCheck.Margin = new Padding(0);
+        _verboseLogCheck.Margin = new Padding(0, 0, 0, 8);
         _verboseLogCheck.CheckedChanged += async (_, _) => await OnToggleOptionChangedAsync();
+
+        var warpRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 3,
+            Margin = new Padding(0)
+        };
+        warpRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        warpRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        warpRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        var warpLabel = CreateSmallLabel("WARP:");
+        warpLabel.Margin = new Padding(0, 5, 6, 0);
+
+        _warpModeCombo = new ComboBox
+        {
+            Dock = DockStyle.Fill,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            BackColor = Theme.InputBackground,
+            ForeColor = Theme.TextPrimary,
+            FlatStyle = FlatStyle.Flat,
+            Font = Theme.SmallFont,
+            Margin = new Padding(0, 0, 6, 0)
+        };
+        _warpModeCombo.Items.Add("Выключен (только zapret)");
+        _warpModeCombo.Items.Add("Выборочно (TikTok, AI, соцсети)");
+        _warpModeCombo.Items.Add("Весь трафик (кроме РФ)");
+        _warpModeCombo.SelectedIndex = Math.Clamp((int)_settings.WarpMode, 0, 2);
+        _warpModeCombo.SelectedIndexChanged += async (_, _) => await OnWarpModeChangedAsync();
+
+        _warpTestButton = CreateButton("Тест", Theme.ButtonNeutral, Theme.ButtonNeutralHover, height: 26);
+        _warpTestButton.Dock = DockStyle.None;
+        _warpTestButton.Width = 56;
+        _warpTestButton.Font = Theme.SmallFont;
+        _warpTestButton.Margin = new Padding(0);
+        _warpTestButton.Click += async (_, _) => await TestWarpAsync();
+
+        warpRow.Controls.Add(warpLabel, 0, 0);
+        warpRow.Controls.Add(_warpModeCombo, 1, 0);
+        warpRow.Controls.Add(_warpTestButton, 2, 0);
 
         netLayout.Controls.Add(netHeader);
         netLayout.Controls.Add(adapterRow);
@@ -385,6 +428,7 @@ public sealed class MainForm : Form
         netLayout.Controls.Add(_blockQuicCheck);
         netLayout.Controls.Add(_enableTgBridgeCheck);
         netLayout.Controls.Add(_verboseLogCheck);
+        netLayout.Controls.Add(warpRow);
         netCard.Controls.Add(netLayout);
         leftColumn.Controls.Add(netCard, 0, 2);
 
@@ -716,6 +760,13 @@ public sealed class MainForm : Form
                 await XrayDownloader.EnsureXrayAsync(progress, _startCts.Token);
             }
 
+            if (_settings.WarpMode != WarpRoutingMode.Off && _settings.WarpAccount is not { IsValid: true })
+            {
+                SetProxyStatus("Регистрация / проверка WARP...", Theme.AccentAmber);
+                var warpProgress = new Progress<string>(msg => SetProxyStatus(msg, Theme.AccentAmber));
+                await WarpAccountService.EnsureAccountAsync(_settings, warpProgress, _startCts.Token);
+            }
+
             SetProxyStatus("Запуск xray.exe...", Theme.AccentAmber);
             _lastTgStatus = TgWsProxyService.GetStatus();
             var lanIp = GetSelectedLanIp();
@@ -747,6 +798,8 @@ public sealed class MainForm : Form
         _blockQuicCheck.Enabled = enabled;
         _enableTgBridgeCheck.Enabled = enabled;
         _verboseLogCheck.Enabled = enabled;
+        _warpModeCombo.Enabled = enabled;
+        _warpTestButton.Enabled = enabled;
     }
 
     private void OnPortEdited()
@@ -805,6 +858,118 @@ public sealed class MainForm : Form
         if (_xrayManager.IsRunning)
         {
             await StartProxyAsync();
+        }
+    }
+
+    private async Task OnWarpModeChangedAsync()
+    {
+        if (_suppressSettingEvents || _isTransitioning)
+            return;
+
+        var newMode = (WarpRoutingMode)Math.Clamp(_warpModeCombo.SelectedIndex, 0, 2);
+        if (newMode == _settings.WarpMode)
+            return;
+
+        var previousMode = _settings.WarpMode;
+        _settings.WarpMode = newMode;
+        _settings.Save();
+
+        if (newMode != WarpRoutingMode.Off && _settings.WarpAccount is not { IsValid: true })
+        {
+            _isTransitioning = true;
+            SetControlsEnabled(false);
+            try
+            {
+                if (!XrayDownloader.IsXrayInstalled())
+                {
+                    SetProxyStatus("Скачивание Xray-core...", Theme.AccentAmber);
+                    var dlProgress = new Progress<string>(msg => SetProxyStatus(msg, Theme.AccentAmber));
+                    await XrayDownloader.EnsureXrayAsync(dlProgress, CancellationToken.None);
+                }
+
+                SetProxyStatus("Регистрация / проверка WARP...", Theme.AccentAmber);
+                var warpProgress = new Progress<string>(msg => SetProxyStatus(msg, Theme.AccentAmber));
+                await WarpAccountService.EnsureAccountAsync(_settings, warpProgress, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _settings.WarpMode = previousMode;
+                _settings.Save();
+                _suppressSettingEvents = true;
+                _warpModeCombo.SelectedIndex = Math.Clamp((int)previousMode, 0, 2);
+                _suppressSettingEvents = false;
+                MessageBox.Show(
+                    this,
+                    $"Не удалось настроить Cloudflare WARP:\n{ex.Message}",
+                    "Cloudflare WARP",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+            finally
+            {
+                _isTransitioning = false;
+                SetControlsEnabled(true);
+                UpdateProxyVisualState();
+            }
+        }
+
+        if (_xrayManager.IsRunning)
+        {
+            await StartProxyAsync();
+        }
+    }
+
+    private async Task TestWarpAsync()
+    {
+        if (_isTransitioning)
+            return;
+
+        _isTransitioning = true;
+        SetControlsEnabled(false);
+        try
+        {
+            if (!XrayDownloader.IsXrayInstalled())
+            {
+                SetProxyStatus("Скачивание Xray-core...", Theme.AccentAmber);
+                var dlProgress = new Progress<string>(msg => SetProxyStatus(msg, Theme.AccentAmber));
+                await XrayDownloader.EnsureXrayAsync(dlProgress, CancellationToken.None);
+            }
+
+            var progress = new Progress<string>(msg => SetProxyStatus(msg, Theme.AccentAmber));
+            var account = await WarpAccountService.EnsureAccountAsync(_settings, progress, CancellationToken.None);
+            var (endpoint, exitIp) = await WarpAccountService.FindWorkingEndpointAsync(account, progress, CancellationToken.None);
+
+            var endpointChanged = !string.Equals(account.Endpoint, endpoint, StringComparison.OrdinalIgnoreCase);
+            account.Endpoint = endpoint;
+            _settings.Save();
+
+            if (endpointChanged && _xrayManager.IsRunning && _settings.WarpMode != WarpRoutingMode.Off)
+            {
+                await _xrayManager.StartAsync(_settings, GetSelectedLanIp(), _lastTgStatus, CancellationToken.None);
+            }
+
+            MessageBox.Show(
+                this,
+                $"WARP работает!\nEndpoint: {endpoint}\nВнешний IP: {exitIp}",
+                "Cloudflare WARP",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                $"Проверка WARP не удалась:\n{ex.Message}",
+                "Cloudflare WARP",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _isTransitioning = false;
+            SetControlsEnabled(true);
+            UpdateProxyVisualState();
         }
     }
 
