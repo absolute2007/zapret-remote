@@ -1,0 +1,17 @@
+# Build & publish outputs
+bin/
+obj/
+dist/
+publish/
+.vs/
+*.user
+*.suo
+
+# Runtime user state & downloaded cores
+settings.json
+zapret-backup.json
+xray.exe
+geoip.dat
+geosite.dat
+xray.runtime.json
+*.log
